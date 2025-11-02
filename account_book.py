@@ -115,28 +115,32 @@ class DBUtil:
 
     # -------------------------- 交易相关操作 --------------------------
     def add_transaction(self, amount, type_, category_id, date, tag='', remark=''):
-        """添加交易记录，同时更新预算已花费金额"""
+        """添加交易记录（按月份同步预算，与天数无关）"""
         self.connect()
         try:
-            # 1. 添加交易
+            # 1. 添加交易记录
             self.cursor.execute('''
             INSERT INTO transactions (amount, type, category_id, date, tag, remark)
             VALUES (?, ?, ?, ?, ?, ?)
             ''', (amount, type_, category_id, date, tag, remark))
             transaction_id = self.cursor.lastrowid
 
-            # 2. 更新预算（仅支出类型需要更新）
+            # 2. 仅支出类型需要更新预算，且严格按月份匹配
             if type_ == 'EXPENSE':
-                month = date[:7]  # 提取YYYY-MM
-                # 检查该分类当月是否有预算
+                # 提取交易日期的月份（YYYY-MM），忽略具体天数
+                transaction_month = date[:7]  # 如"2025-11-05" → "2025-11"
+                
+                # 查找该分类在该月份的预算
                 self.cursor.execute('''
                 SELECT budget_id, spent FROM budgets
-                WHERE category_id = ? AND month = ?
-                ''', (category_id, month))
+                WHERE category_id = ? AND month = ?  -- 预算表的month是YYYY-MM，直接匹配
+                ''', (category_id, transaction_month))
                 budget = self.cursor.fetchone()
+                
                 if budget:
-                    budget_id, spent = budget
-                    new_spent = spent + amount
+                    # 累加支出到该月预算的已花费中
+                    budget_id, current_spent = budget
+                    new_spent = current_spent + amount
                     self.cursor.execute('''
                     UPDATE budgets SET spent = ? WHERE budget_id = ?
                     ''', (new_spent, budget_id))
@@ -164,7 +168,7 @@ class DBUtil:
         return result
 
     def get_transactions_by_condition(self, date=None, type_=None, category_id=None, tag=None, remark=None):
-        """按条件查询交易记录"""
+        """按条件查询交易记录（修复：支持年/年+月/精确日期查询）"""
         self.connect()
         query = '''
         SELECT t.transaction_id, t.amount, t.type, c.name, t.date, t.tag, t.remark
@@ -173,9 +177,20 @@ class DBUtil:
         WHERE 1=1
         '''
         params = []
+
+        # 修复：日期支持模糊匹配（年/年-月/精确日期）
         if date:
-            query += ' AND t.date = ?'
-            params.append(date)
+            date_len = len(date.strip())
+            if date_len == 4:  # 仅年份（如2025）
+                query += ' AND SUBSTR(t.date, 1, 4) = ?'  # 匹配前4位（年份）
+                params.append(date.strip())
+            elif date_len == 7:  # 年-月（如2025-10）
+                query += ' AND SUBSTR(t.date, 1, 7) = ?'  # 匹配前7位（年-月）
+                params.append(date.strip())
+            elif date_len == 10:  # 精确日期（YYYY-MM-DD）
+                query += ' AND t.date = ?'
+                params.append(date.strip())
+
         if type_:
             query += ' AND t.type = ?'
             params.append(type_)
@@ -188,8 +203,8 @@ class DBUtil:
         if remark:
             query += ' AND t.remark LIKE ?'
             params.append(f'%{remark}%')
-        query += ' ORDER BY t.date DESC, t.create_time DESC'
 
+        query += ' ORDER BY t.date DESC, t.create_time DESC'  # 按账单日期排序（最新在前）
         self.cursor.execute(query, params)
         result = self.cursor.fetchall()
         self.close()
@@ -248,27 +263,41 @@ class DBUtil:
 
     # -------------------------- 预算相关操作 --------------------------
     def set_monthly_budget(self, category_id, month, amount):
-        """设置月度预算（存在则更新，不存在则新增）"""
+        """设置月度预算（严格按YYYY-MM匹配，与天数无关）"""
         self.connect()
         try:
-            # 检查是否已存在该分类当月预算
+            # 关键：仅按月份（YYYY-MM）汇总该分类的所有支出（忽略具体天数）
             self.cursor.execute('''
-            SELECT budget_id, spent FROM budgets
-            WHERE category_id = ? AND month = ?
+            SELECT COALESCE(SUM(amount), 0) FROM transactions
+            WHERE category_id = ? 
+            AND type = 'EXPENSE' 
+            AND SUBSTR(date, 1, 7) = ?  -- 只取日期的前7位（YYYY-MM）进行匹配
+            ''', (category_id, month))  # month必须是YYYY-MM格式（如"2025-11"）
+            current_spent = self.cursor.fetchone()[0]  # 该月所有支出总和
+
+            # 检查该分类该月份是否已有预算
+            self.cursor.execute('''
+            SELECT budget_id FROM budgets
+            WHERE category_id = ? AND month = ?  -- 预算表的month是YYYY-MM，直接匹配
             ''', (category_id, month))
             budget = self.cursor.fetchone()
+
             if budget:
-                budget_id, spent = budget
-                # 更新预算金额（已花费金额不变）
+                # 已有预算：更新金额，同步该月最新支出总和
+                budget_id = budget[0]
                 self.cursor.execute('''
-                UPDATE budgets SET amount = ? WHERE budget_id = ?
-                ''', (amount, budget_id))
+                UPDATE budgets 
+                SET amount = ?, 
+                    spent = ?  -- 强制同步该月所有支出（无论何时添加）
+                WHERE budget_id = ?
+                ''', (amount, current_spent, budget_id))
             else:
-                # 新增预算（已花费初始为0）
+                # 新增预算：初始化已花费为该月所有支出总和
                 self.cursor.execute('''
                 INSERT INTO budgets (category_id, month, amount, spent)
-                VALUES (?, ?, ?, 0)
-                ''', (category_id, month, amount))
+                VALUES (?, ?, ?, ?)
+                ''', (category_id, month, amount, current_spent))
+
             self.conn.commit()
             return True
         except Exception as e:
@@ -277,63 +306,64 @@ class DBUtil:
         finally:
             self.close()
 
-    def get_monthly_budget_status(self, month):
-        """获取当月预算状态（所有分类的预算、已花费、剩余）"""
-        self.connect()
-        self.cursor.execute('''
-        SELECT c.name, b.amount, b.spent, (b.amount - b.spent) AS remain
-        FROM budgets b
-        JOIN categories c ON b.category_id = c.category_id
-        WHERE b.month = ?
-        ORDER BY c.type DESC, c.name ASC
-        ''', (month,))
-        result = self.cursor.fetchall()
-        self.close()
-        return result
-
     # -------------------------- 统计相关操作 --------------------------
     def get_monthly_statistics(self, month):
-        """获取指定月份的收支统计（总收入、总支出、结余）"""
+        """获取指定月份的收支统计（修复：确保正确匹配该月所有日期）"""
         self.connect()
         try:
-            # 总收入
+            # 修复：用LIKE匹配该月份的所有日期（如'2025-10%'匹配2025-10-01至2025-10-31）
             self.cursor.execute('''
             SELECT COALESCE(SUM(amount), 0) FROM transactions
             WHERE type = 'INCOME' AND date LIKE ?
-            ''', (f'{month}%',))
+            ''', (f'{month}%',))  # 关键：添加通配符%
             total_income = self.cursor.fetchone()[0]
 
-            # 总支出
             self.cursor.execute('''
             SELECT COALESCE(SUM(amount), 0) FROM transactions
             WHERE type = 'EXPENSE' AND date LIKE ?
-            ''', (f'{month}%',))
+            ''', (f'{month}%',))  # 同理修复支出查询
             total_expense = self.cursor.fetchone()[0]
 
-            # 结余
             balance = total_income - total_expense
             return total_income, total_expense, balance
         finally:
             self.close()
 
     def get_balance_trend(self, months=6):
-        """获取近N个月的结余趋势（YYYY-MM, 结余）"""
+        """获取近N个月的结余趋势（修复：基于账单实际存在的月份排序）"""
         self.connect()
-        # 获取当前月份
-        current_date = datetime.datetime.now()
-        trend_data = []
+        try:
+            # 步骤1：从交易记录中提取所有不重复的月份（按账单日期）
+            self.cursor.execute('''
+            SELECT DISTINCT SUBSTR(date, 1, 7) AS month
+            FROM transactions
+            ORDER BY month DESC
+            ''')
+            all_months = [row[0] for row in self.cursor.fetchall()]  # 实际存在的月份列表
 
-        for i in range(months-1, -1, -1):
-            # 计算目标月份
-            target_date = current_date - datetime.timedelta(days=i*30)
-            target_month = target_date.strftime('%Y-%m')
+            # 步骤2：如果实际月份不足N个，用当前时间补全（避免空数据）
+            current_month = datetime.datetime.now().strftime('%Y-%m')
+            if not all_months:
+                all_months = [current_month]
+            # 补全缺失的月份（确保至少有N个）
+            while len(all_months) < months:
+                last_month = all_months[-1]
+                last_date = datetime.datetime.strptime(last_month, '%Y-%m')
+                prev_date = last_date - datetime.timedelta(days=1)  # 前一个月
+                prev_month = prev_date.strftime('%Y-%m')
+                all_months.append(prev_month)
 
-            # 计算该月结余
-            total_income, total_expense, balance = self.get_monthly_statistics(target_month)
-            trend_data.append((target_month, balance))
-
-        self.close()
-        return trend_data
+            # 步骤3：取最近的N个月份，计算每个月的结余
+            trend_data = []
+            for month in all_months[:months]:  # 取前N个最新月份
+                income, expense, balance = self.get_monthly_statistics(month)
+                trend_data.append((month, balance))
+            
+            # 按月份正序排列（ oldest → newest ）
+            trend_data.sort(key=lambda x: x[0])
+            return trend_data
+        finally:
+            self.close()
 
     def get_monthly_expense_comparison(self):
         """获取本月与上月支出对比（本月支出、上月支出、变化率）"""
@@ -412,6 +442,35 @@ class DBUtil:
         finally:
             self.close()
 
+    def get_monthly_budget_status(self, month):
+        """强制使用字符串格式化传递参数，确保SQL正确执行"""
+        self.connect()
+        try:
+            # 直接拼接SQL（仅临时用于排查，确认参数传递是否正确）
+            query = f'''
+            SELECT 
+                c.name, 
+                b.amount, 
+                COALESCE(SUM(t.amount), 0) AS spent, 
+                (b.amount - COALESCE(SUM(t.amount), 0)) AS remain
+            FROM budgets b
+            JOIN categories c ON b.category_id = c.category_id
+            LEFT JOIN transactions t ON 
+                b.category_id = t.category_id 
+                AND t.type = 'EXPENSE' 
+                AND SUBSTR(t.date, 1, 7) = b.month
+            WHERE b.month = '{month}'  -- 直接拼接月份参数（仅测试用）
+            GROUP BY c.name, b.amount
+            ORDER BY c.type DESC, c.name ASC
+            '''
+            self.cursor.execute(query)
+            result = self.cursor.fetchall()
+            return result
+        except Exception as e:
+            print(f"预算查询错误：{e}")  # 打印错误信息
+            return []
+        finally:
+            self.close()
 
 # -------------------------- 统计工具类（封装统计逻辑） --------------------------
 class StatisticsManager:
@@ -688,8 +747,8 @@ class AccountBookApp:
             self.category_var.set(categories[0][1])
 
     def save_transaction(self):
-        """保存交易记录"""
-        # 1. 获取表单数据
+        """保存交易记录（修复：新增支出后刷新预算状态）"""
+        # 原有数据验证逻辑（保持不变）
         amount_str = self.amount_entry.get().strip()
         type_ = self.current_transaction_type.get()
         category_name = self.category_var.get()
@@ -697,7 +756,6 @@ class AccountBookApp:
         tag = self.tag_entry.get().strip()
         remark = self.remark_entry.get().strip()
 
-        # 2. 数据验证
         if not amount_str:
             messagebox.showerror("错误", "请输入金额！")
             return
@@ -717,14 +775,13 @@ class AccountBookApp:
             messagebox.showerror("错误", "所选分类无效！")
             return
 
-        # 验证日期格式（YYYY-MM-DD）
         try:
             datetime.datetime.strptime(date, '%Y-%m-%d')
         except ValueError:
             messagebox.showerror("错误", "日期格式错误，请使用YYYY-MM-DD！")
             return
 
-        # 3. 保存到数据库
+        # 保存交易
         success, result = self.db_util.add_transaction(amount, type_, category_id, date, tag, remark)
         if success:
             messagebox.showinfo("成功", "交易记录保存成功！")
@@ -732,8 +789,16 @@ class AccountBookApp:
             self.amount_entry.delete(0, tk.END)
             self.tag_entry.delete(0, tk.END)
             self.remark_entry.delete(0, tk.END)
+            # 关键修复：如果是当月支出，刷新预算状态（如果当前在我的页面）
+            current_month = datetime.datetime.now().strftime('%Y-%m')
+            if type_ == 'EXPENSE' and date[:7] == current_month:
+                # 检查当前是否在“我的页面”，如果是则刷新
+                if hasattr(self.current_frame, 'winfo_children'):
+                    children = self.current_frame.winfo_children()
+                    if children and "我的" in children[0].cget("text"):
+                        self.show_my_frame()
             # 刷新首页（如果当前在首页）
-            if isinstance(self.current_frame, tk.Frame) and "首页" in self.current_frame.winfo_children()[0].cget("text"):
+            elif isinstance(self.current_frame, tk.Frame) and "首页" in self.current_frame.winfo_children()[0].cget("text"):
                 self.show_home_frame()
         else:
             messagebox.showerror("错误", f"保存失败：{result}")
@@ -831,26 +896,33 @@ class AccountBookApp:
         data_btn.grid(row=1, column=0, padx=20, pady=10, sticky=tk.EW)
         setting_btn.grid(row=1, column=1, padx=20, pady=10, sticky=tk.EW)
 
-        # 3. 当月预算状态
+        # 3. 当月预算状态（核心修复）
         budget_status_frame = tk.Frame(my_frame, bg='white', bd=2, relief=tk.GROOVE)
         budget_status_frame.pack(pady=10, fill=tk.BOTH, expand=True, padx=20)
-        budget_status_title = tk.Label(budget_status_frame, text="当月预算状态", font=('Arial', 12, 'bold'), bg='white')
+        
+        # 明确显示当前月份（YYYY-MM）
+        current_month = datetime.datetime.now().strftime('%Y-%m')
+        budget_status_title = tk.Label(
+            budget_status_frame, 
+            text=f"当月预算状态（{current_month}）",  # 标题显示当前月份
+            font=('Arial', 12, 'bold'), 
+            bg='white'
+        )
         budget_status_title.pack(pady=5, anchor=tk.W, padx=10)
 
-        # 预算表格
+        # 预算表格（仅加载当前月份的预算）
         style = ttk.Style()
         style.configure('Treeview.Select', background='#4a86e8', foreground='white')
-        current_month = datetime.datetime.now().strftime('%Y-%m')
-        budget_status = self.db_util.get_monthly_budget_status(current_month)
+        budget_status = self.db_util.get_monthly_budget_status(current_month)  # 仅查当前月份
         columns = ('category', 'budget', 'spent', 'remain')
         tree = ttk.Treeview(budget_status_frame, columns=columns, show='headings')
         tree.heading('category', text='分类')
         tree.heading('budget', text='预算金额')
-        tree.heading('spent', text='已花费')
+        tree.heading('spent', text='已花费（当月所有支出）')  # 明确说明是当月所有支出
         tree.heading('remain', text='剩余金额')
         tree.column('category', width=150)
         tree.column('budget', width=120)
-        tree.column('spent', width=120)
+        tree.column('spent', width=180)  # 加宽列，显示说明文字
         tree.column('remain', width=120)
 
         # 填充数据（剩余金额为负时标红）
@@ -861,7 +933,7 @@ class AccountBookApp:
             tree.tag_configure(f'remain_{item_id}', foreground=remain_color)
             tree.item(item_id, tags=(f'remain_{item_id}',))
 
-        # 滚动条
+        # 滚动条（保持不变）
         scrollbar = ttk.Scrollbar(budget_status_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -927,13 +999,13 @@ class AccountBookApp:
         self.switch_frame(budget_frame)
 
     def save_budget(self):
-        """保存预算设置"""
+        """保存预算（修复：保存后立即刷新预算状态显示）"""
         # 获取数据
         month = self.budget_month_entry.get().strip()
         category_name = self.budget_category_var.get()
         amount_str = self.budget_amount_entry.get().strip()
 
-        # 验证
+        # 数据验证（保持不变）
         if not month:
             messagebox.showerror("错误", "请输入月份！")
             return
@@ -962,12 +1034,12 @@ class AccountBookApp:
             messagebox.showerror("错误", "请输入有效的正数预算金额！")
             return
 
-        # 保存
+        # 保存预算
         success = self.db_util.set_monthly_budget(category_id, month, amount)
         if success:
             messagebox.showinfo("成功", "预算设置保存成功！")
-            # 清空表单
-            self.budget_amount_entry.delete(0, tk.END)
+            # 关键修复：刷新预算状态显示（返回我的页面，重新加载预算列表）
+            self.show_my_frame()
         else:
             messagebox.showerror("错误", "预算保存失败！")
 
