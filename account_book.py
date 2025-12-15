@@ -111,6 +111,7 @@ class DBUtil:
         # 初始化设置（如果不存在）
         self.cursor.execute('INSERT OR IGNORE INTO settings (user_id) VALUES (?)', (1,))
 
+        self.conn.commit()
         self.close()
 
     # -------------------------- 交易相关操作 --------------------------
