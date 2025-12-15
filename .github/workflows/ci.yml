@@ -1,0 +1,43 @@
+name: Account Book CI
+
+# 触发条件：推送到master分支，或提交PR到master分支
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    # 使用最新版Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. 下载代码
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # 2. 安装 Python 3.10
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    # 3. 安装依赖
+    # 注意：这里额外安装了python3-tk和xvfb，是为了让tkinter代码在无显示器的服务器上不报错
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-tk xvfb
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # 4. 运行测试
+    # 使用xvfb-run模拟显示环境，并设置matplotlib后端为Agg(不显示图片)
+    - name: Run Unit and Integration Tests
+      env:
+        MPLBACKEND: Agg
+      run: |
+        #这里的xvfb-run -a是关键，它能欺骗tkinter以为有显示器
+        #运行所有以test_开头的文件（包括单元测试和集成测试）
+        xvfb-run -a pytest --cov=account_book
